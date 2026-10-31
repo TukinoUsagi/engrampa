@@ -3947,6 +3947,84 @@ get_uri_list_from_selection_data (char *uri_list)
 	return g_list_reverse (list);
 }
 
+/* Return the row of @view_widget (the file list or the folder tree) that is
+ * under the point (@x, @y) given in the coordinates of @widget, or NULL when
+ * the point is not on a row of that view. */
+static GtkTreePath *
+fr_window_get_row_at_point (GtkWidget *view_widget,
+			    GtkWidget *widget,
+			    gint       x,
+			    gint       y)
+{
+	GtkTreeView *view = GTK_TREE_VIEW (view_widget);
+	GtkTreePath *path = NULL;
+	gint         view_x;
+	gint         view_y;
+
+	if (! gtk_widget_get_mapped (view_widget))
+		return NULL;
+
+	if (! gtk_widget_translate_coordinates (widget, view_widget,
+						x, y, &view_x, &view_y))
+		return NULL;
+
+	/* The point must be inside the view itself. */
+	if ((view_x < 0) || (view_y < 0)
+	    || (view_x >= gtk_widget_get_allocated_width (view_widget))
+	    || (view_y >= gtk_widget_get_allocated_height (view_widget)))
+		return NULL;
+
+	/* gtk_tree_view_get_path_at_pos() expects bin_window coordinates
+	 * (the column header is not part of them). */
+	gtk_tree_view_convert_widget_to_bin_window_coords (view,
+							   view_x, view_y,
+							   &view_x, &view_y);
+
+	if (! gtk_tree_view_get_path_at_pos (view, view_x, view_y,
+					     &path, NULL, NULL, NULL))
+		return NULL;
+
+	return path;
+}
+
+/* Get the destination folder from a row of the folder tree. */
+static gboolean
+fr_window_get_tree_row_folder (FrWindow    *window,
+			       GtkTreePath *path,
+			       char       **folder)
+{
+	GtkTreeIter  iter;
+	char        *dir_path = NULL;
+
+	if (gtk_tree_model_get_iter (GTK_TREE_MODEL (window->priv->tree_store),
+				     &iter, path))
+		gtk_tree_model_get (GTK_TREE_MODEL (window->priv->tree_store),
+				    &iter,
+				    TREE_COLUMN_PATH, &dir_path,
+				    -1);
+
+	if (dir_path == NULL)
+		return FALSE;
+
+	/* The paths of the folder tree have no trailing slash (except the
+	 * root); the destination folder is expected to have one. */
+	if (g_str_has_suffix (dir_path, "/"))
+		*folder = dir_path;
+	else {
+		*folder = g_strconcat (dir_path, "/", NULL);
+		g_free (dir_path);
+	}
+
+	/* Dropping on the folder that is already open moves nothing. */
+	if (strcmp (*folder, fr_window_get_current_location (window)) == 0) {
+		g_free (*folder);
+		*folder = NULL;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
 static gboolean
 fr_window_get_drop_folder (FrWindow  *window,
 			   GtkWidget *widget,
@@ -3957,8 +4035,6 @@ fr_window_get_drop_folder (FrWindow  *window,
 	GtkTreePath *path = NULL;
 	GtkTreeIter  iter;
 	FileData    *fdata = NULL;
-	gint         list_x;
-	gint         list_y;
 
 	*folder = NULL;
 
@@ -3966,22 +4042,20 @@ fr_window_get_drop_folder (FrWindow  *window,
 	if (window->priv->list_mode == FR_WINDOW_LIST_MODE_FLAT)
 		return FALSE;
 
-	/* Convert window coordinates to file-list coordinates. */
-	if (! gtk_widget_translate_coordinates (widget,
-						window->priv->list_view,
-						x, y, &list_x, &list_y))
-		return FALSE;
+	/* A row of the folder tree. */
+	path = fr_window_get_row_at_point (window->priv->tree_view, widget, x, y);
+	if (path != NULL) {
+		gboolean found;
 
-	/* gtk_tree_view_get_path_at_pos() expects bin_window coordinates
-	 * (the column header is not part of them). */
-	gtk_tree_view_convert_widget_to_bin_window_coords (
-			GTK_TREE_VIEW (window->priv->list_view),
-			list_x, list_y, &list_x, &list_y);
+		found = fr_window_get_tree_row_folder (window, path, folder);
+		gtk_tree_path_free (path);
 
-	/* A drop is accepted only on an actual row. */
-	if (! gtk_tree_view_get_path_at_pos (
-		    GTK_TREE_VIEW (window->priv->list_view),
-		    list_x, list_y, &path, NULL, NULL, NULL))
+		return found;
+	}
+
+	/* A drop on the file list is accepted only on an actual row. */
+	path = fr_window_get_row_at_point (window->priv->list_view, widget, x, y);
+	if (path == NULL)
 		return FALSE;
 
 	if (gtk_tree_model_get_iter (
@@ -4009,43 +4083,42 @@ fr_window_get_drop_folder (FrWindow  *window,
 	return TRUE;
 }
 
-/* Highlight the folder row that would receive the dropped files. */
-static void
-fr_window_set_drop_highlight (FrWindow  *window,
-			      GtkWidget *widget,
-			      gint       x,
-			      gint       y)
-{
-	GtkTreeView *view = GTK_TREE_VIEW (window->priv->list_view);
-	GtkTreePath *path = NULL;
-	gint         list_x;
-	gint         list_y;
-
-	if (gtk_widget_translate_coordinates (widget, window->priv->list_view,
-					      x, y, &list_x, &list_y)) {
-		gtk_tree_view_convert_widget_to_bin_window_coords (view,
-								   list_x, list_y,
-								   &list_x, &list_y);
-		gtk_tree_view_get_path_at_pos (view, list_x, list_y,
-					       &path, NULL, NULL, NULL);
-	}
-
-	if (path != NULL) {
-		gtk_tree_view_set_drag_dest_row (view, path,
-						 GTK_TREE_VIEW_DROP_INTO_OR_BEFORE);
-		gtk_tree_path_free (path);
-	}
-	else
-		gtk_tree_view_set_drag_dest_row (view, NULL,
-						 GTK_TREE_VIEW_DROP_BEFORE);
-}
-
 static void
 fr_window_clear_drop_highlight (FrWindow *window)
 {
 	gtk_tree_view_set_drag_dest_row (GTK_TREE_VIEW (window->priv->list_view),
 					 NULL,
 					 GTK_TREE_VIEW_DROP_BEFORE);
+	gtk_tree_view_set_drag_dest_row (GTK_TREE_VIEW (window->priv->tree_view),
+					 NULL,
+					 GTK_TREE_VIEW_DROP_BEFORE);
+}
+
+/* Highlight the folder row (in the file list or in the folder tree) that
+ * would receive the dropped files. */
+static void
+fr_window_set_drop_highlight (FrWindow  *window,
+			      GtkWidget *widget,
+			      gint       x,
+			      gint       y)
+{
+	GtkWidget   *view;
+	GtkTreePath *path;
+
+	fr_window_clear_drop_highlight (window);
+
+	view = window->priv->tree_view;
+	path = fr_window_get_row_at_point (view, widget, x, y);
+	if (path == NULL) {
+		view = window->priv->list_view;
+		path = fr_window_get_row_at_point (view, widget, x, y);
+	}
+	if (path == NULL)
+		return;
+
+	gtk_tree_view_set_drag_dest_row (GTK_TREE_VIEW (view), path,
+					 GTK_TREE_VIEW_DROP_INTO_OR_BEFORE);
+	gtk_tree_path_free (path);
 }
 
 static void
