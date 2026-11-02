@@ -3549,6 +3549,12 @@ dir_tree_button_press_cb (GtkWidget      *widget,
 	if (selection == NULL)
 		return FALSE;
 
+	/* Control + drag copies a folder: a Control + click must select the
+	 * folder, not toggle it (which would unselect the folder that is about
+	 * to be dragged). */
+	if ((event->type == GDK_BUTTON_PRESS) && (event->button == 1))
+		event->state &= ~GDK_CONTROL_MASK;
+
 	if ((event->type == GDK_BUTTON_PRESS) && (event->button == 3)) {
 		GtkTreePath *path;
 		GtkTreeIter  iter;
@@ -4015,13 +4021,6 @@ fr_window_get_tree_row_folder (FrWindow    *window,
 		g_free (dir_path);
 	}
 
-	/* Dropping on the folder that is already open moves nothing. */
-	if (strcmp (*folder, fr_window_get_current_location (window)) == 0) {
-		g_free (*folder);
-		*folder = NULL;
-		return FALSE;
-	}
-
 	return TRUE;
 }
 
@@ -4083,24 +4082,127 @@ fr_window_get_drop_folder (FrWindow  *window,
 	return TRUE;
 }
 
+/* Get the folder (with a trailing slash) that contains the dragged items.
+ * When a folder of the folder tree is dragged, @dragged_folder is set to
+ * that folder (also with a trailing slash).  Returns NULL when the drag
+ * cannot be moved or copied inside the archive (the archive root). */
+static char *
+fr_window_get_drag_base_dir (FrWindow   *window,
+			     GtkWidget  *source,
+			     char      **dragged_folder)
+{
+	char       *folder;
+	char       *base_dir;
+	const char *last_slash;
+	size_t      length;
+
+	if (dragged_folder != NULL)
+		*dragged_folder = NULL;
+
+	if (source == window->priv->list_view)
+		return g_strdup (fr_window_get_current_location (window));
+
+	/* Only one folder at a time. */
+	if (gtk_tree_selection_count_selected_rows (
+		    gtk_tree_view_get_selection (GTK_TREE_VIEW (window->priv->tree_view))) != 1)
+		return NULL;
+
+	folder = fr_window_get_selected_folder_in_tree_view (window);
+	if (folder == NULL)
+		return NULL;
+
+	/* The paths of the folder tree have no trailing slash. */
+	length = strlen (folder);
+	while ((length > 1) && (folder[length - 1] == '/'))
+		folder[--length] = '\0';
+
+	/* The archive root cannot be moved. */
+	if ((length == 0) || (strcmp (folder, "/") == 0)) {
+		g_free (folder);
+		return NULL;
+	}
+
+	last_slash = strrchr (folder, '/');
+	base_dir = g_strndup (folder, (last_slash - folder) + 1);
+
+	if (dragged_folder != NULL)
+		*dragged_folder = g_strconcat (folder, "/", NULL);
+
+	g_free (folder);
+
+	return base_dir;
+}
+
+/* A drop is useless or harmful when the destination is the folder that
+ * already contains the dragged items, or the dragged folder itself or one
+ * of its subfolders. */
+static gboolean
+fr_window_drop_allowed (FrWindow   *window,
+			GtkWidget  *source,
+			const char *destination)
+{
+	char     *base_dir;
+	char     *dragged_folder = NULL;
+	gboolean  allowed;
+
+	base_dir = fr_window_get_drag_base_dir (window, source, &dragged_folder);
+	if (base_dir == NULL)
+		return FALSE;
+
+	allowed = (strcmp (destination, base_dir) != 0)
+		  && ((dragged_folder == NULL)
+		      || ! g_str_has_prefix (destination, dragged_folder));
+
+	g_free (base_dir);
+	g_free (dragged_folder);
+
+	return allowed;
+}
+
+/* Control + drag copies instead of moving. */
+static gboolean
+fr_window_drag_is_copy (GtkWidget      *widget,
+			GdkDragContext *context)
+{
+	GdkDevice       *device = gdk_drag_context_get_device (context);
+	GdkWindow       *gdk_window = gtk_widget_get_window (widget);
+	GdkModifierType  mask = 0;
+
+	if ((device == NULL) || (gdk_window == NULL))
+		return FALSE;
+
+	gdk_window_get_device_position (gdk_window, device, NULL, NULL, &mask);
+
+	return (mask & GDK_CONTROL_MASK) != 0;
+}
+
 static void
 fr_window_clear_drop_highlight (FrWindow *window)
 {
-	gtk_tree_view_set_drag_dest_row (GTK_TREE_VIEW (window->priv->list_view),
-					 NULL,
-					 GTK_TREE_VIEW_DROP_BEFORE);
-	gtk_tree_view_set_drag_dest_row (GTK_TREE_VIEW (window->priv->tree_view),
-					 NULL,
-					 GTK_TREE_VIEW_DROP_BEFORE);
+	GtkWidget *views[2];
+	int        i;
+
+	views[0] = window->priv->list_view;
+	views[1] = window->priv->tree_view;
+
+	for (i = 0; i < 2; i++) {
+		gtk_tree_view_set_drag_dest_row (GTK_TREE_VIEW (views[i]),
+						 NULL,
+						 GTK_TREE_VIEW_DROP_BEFORE);
+		gtk_style_context_remove_class (gtk_widget_get_style_context (views[i]),
+						"engrampa-drop-copy");
+	}
 }
 
 /* Highlight the folder row (in the file list or in the folder tree) that
- * would receive the dropped files. */
+ * would receive the dropped files.  The frame has another color when the
+ * files are copied. */
 static void
 fr_window_set_drop_highlight (FrWindow  *window,
 			      GtkWidget *widget,
 			      gint       x,
-			      gint       y)
+			      gint       y,
+			      gboolean   copy)
 {
 	GtkWidget   *view;
 	GtkTreePath *path;
@@ -4115,6 +4217,10 @@ fr_window_set_drop_highlight (FrWindow  *window,
 	}
 	if (path == NULL)
 		return;
+
+	if (copy)
+		gtk_style_context_add_class (gtk_widget_get_style_context (view),
+					     "engrampa-drop-copy");
 
 	gtk_tree_view_set_drag_dest_row (GTK_TREE_VIEW (view), path,
 					 GTK_TREE_VIEW_DROP_INTO_OR_BEFORE);
@@ -4143,7 +4249,8 @@ fr_window_install_drop_style (void)
 
 	provider = gtk_css_provider_new ();
 	gtk_css_provider_load_from_data (provider,
-					 "treeview.view.dnd { border: 2px solid #e66100; }",
+					 "treeview.view:drop(active) { border-color: #e66100; } "
+					 "treeview.view.engrampa-drop-copy:drop(active) { border-color: #26a269; }",
 					 -1, NULL);
 	gtk_style_context_add_provider_for_screen (gdk_screen_get_default (),
 						   GTK_STYLE_PROVIDER (provider),
@@ -4167,27 +4274,27 @@ fr_window_drag_motion (GtkWidget      *widget,
 
 	source = gtk_drag_get_source_widget (context);
 
-	/* Allow internal file-list drags only when hovering over a folder. */
-	if (source == window->priv->list_view) {
+	/* Allow internal drags (from the file list or from the folder tree)
+	 * only when hovering over a folder. */
+	if ((source == window->priv->list_view)
+	    || (source == window->priv->tree_view))
+	{
 		if ((window->priv->activity_ref > 0)
 		    || ! fr_window_get_drop_folder (window, widget, x, y,
-						    &destination_folder))
+						    &destination_folder)
+		    || ! fr_window_drop_allowed (window, source, destination_folder))
 		{
+			g_free (destination_folder);
 			fr_window_clear_drop_highlight (window);
 			gdk_drag_status (context, 0, time);
 			return TRUE;
 		}
 
 		g_free (destination_folder);
-		fr_window_set_drop_highlight (window, widget, x, y);
+		fr_window_set_drop_highlight (window, widget, x, y,
+					     fr_window_drag_is_copy (widget, context));
 		gdk_drag_status (context, GDK_ACTION_COPY, time);
 		return TRUE;
-	}
-
-	/* Keep the existing rejection of folder-tree-originated drags. */
-	if (source == window->priv->tree_view) {
-		gdk_drag_status (context, 0, time);
-		return FALSE;
 	}
 
 	return TRUE;
@@ -4245,8 +4352,11 @@ fr_window_drag_data_received  (GtkWidget          *widget,
 
 	source = gtk_drag_get_source_widget (context);
 
-	/* Handle a drag originating from the archive file list. */
-	if (source == window->priv->list_view) {
+	/* Handle a drag originating from the archive file list or from the
+	 * folder tree. */
+	if ((source == window->priv->list_view)
+	    || (source == window->priv->tree_view))
+	{
 		FrClipboardData *dnd_data;
 
 		fr_window_clear_drop_highlight (window);
@@ -4256,7 +4366,8 @@ fr_window_drag_data_received  (GtkWidget          *widget,
 		    || (gtk_selection_data_get_format (data) != 8)
 		    || (gtk_selection_data_get_target (data) != XFR_ATOM)
 		    || ! fr_window_get_drop_folder (window, widget, x, y,
-						    &destination_folder))
+						    &destination_folder)
+		    || ! fr_window_drop_allowed (window, source, destination_folder))
 		{
 			g_free (destination_folder);
 			gtk_drag_finish (context, FALSE, FALSE, time);
@@ -4266,6 +4377,23 @@ fr_window_drag_data_received  (GtkWidget          *widget,
 		dnd_data = get_clipboard_data_from_selection_data (
 			window,
 			(char *) gtk_selection_data_get_data (data));
+
+		/* The data of a dragged folder of the folder tree is relative to
+		 * the folder itself.  Make it relative to its parent, so that the
+		 * folder (and not only its content) is moved or copied. */
+		if (source == window->priv->tree_view) {
+			char *parent = fr_window_get_drag_base_dir (window, source, NULL);
+
+			if (parent == NULL) {
+				fr_clipboard_data_unref (dnd_data);
+				g_free (destination_folder);
+				gtk_drag_finish (context, FALSE, FALSE, time);
+				return;
+			}
+
+			g_free (dnd_data->base_dir);
+			dnd_data->base_dir = parent;
+		}
 
 		/* Never move a folder into itself or one of its subfolders.
 		 *
@@ -4317,18 +4445,15 @@ fr_window_drag_data_received  (GtkWidget          *widget,
 			}
 		}
 
-		/* Internal moves are distinct from clipboard cut/paste. */
-		dnd_data->op = FR_CLIPBOARD_OP_MOVE;
+		/* Control + drag copies, a plain drag moves.  Internal moves are
+		 * distinct from clipboard cut/paste. */
+		dnd_data->op = fr_window_drag_is_copy (widget, context)
+			       ? FR_CLIPBOARD_OP_COPY
+			       : FR_CLIPBOARD_OP_MOVE;
 		dnd_data->current_dir = destination_folder;
 
 		gtk_drag_finish (context, TRUE, FALSE, time);
 		fr_window_paste_from_clipboard_data (window, dnd_data);
-		return;
-	}
-
-	/* Preserve the existing rejection of folder-tree-originated drags. */
-	if (source == window->priv->tree_view) {
-		gtk_drag_finish (context, FALSE, FALSE, time);
 		return;
 	}
 
