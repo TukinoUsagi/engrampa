@@ -320,6 +320,16 @@ struct _FrWindowPrivateData {
 	int              drop_last_y;
 	gboolean         drop_last_copy;
 
+	/* What is dragged, remembered when the drag starts: the file list can
+	 * show another folder while dragging. */
+	char            *dnd_data;           /* selection data of the dragged items */
+	char            *dnd_base_dir;       /* folder that contains them */
+	char            *dnd_dragged_folder; /* dragged folder of the tree, or NULL */
+	char            *dnd_origin;         /* folder shown when the drag started */
+	gboolean         dnd_dropped;
+	guint            drop_navigate_timeout;
+	char            *drop_navigate_folder;
+
 	gboolean         stoppable;
 	gboolean         closing;
 
@@ -596,6 +606,15 @@ fr_window_free_private_data (FrWindow *window)
 		g_source_remove (window->priv->drop_scroll_timeout);
 		window->priv->drop_scroll_timeout = 0;
 	}
+	if (window->priv->drop_navigate_timeout != 0) {
+		g_source_remove (window->priv->drop_navigate_timeout);
+		window->priv->drop_navigate_timeout = 0;
+	}
+	g_clear_pointer (&window->priv->drop_navigate_folder, g_free);
+	g_clear_pointer (&window->priv->dnd_data, g_free);
+	g_clear_pointer (&window->priv->dnd_base_dir, g_free);
+	g_clear_pointer (&window->priv->dnd_dragged_folder, g_free);
+	g_clear_pointer (&window->priv->dnd_origin, g_free);
 
 	g_clear_error (&window->priv->drag_error);
 	path_list_free (window->priv->drag_file_list);
@@ -1691,6 +1710,26 @@ fr_window_update_current_location (FrWindow *window)
 	g_free (path);
 }
 
+static gboolean dir_tree_selection_changed_cb (GtkTreeSelection *selection,
+					       gpointer          user_data);
+
+static void
+collect_expanded_row_cb (GtkTreeView *tree_view,
+			 GtkTreePath *path,
+			 gpointer     user_data)
+{
+	GPtrArray    *expanded = user_data;
+	GtkTreeModel *model = gtk_tree_view_get_model (tree_view);
+	GtkTreeIter   iter;
+	char         *folder = NULL;
+
+	if (gtk_tree_model_get_iter (model, &iter, path))
+		gtk_tree_model_get (model, &iter, TREE_COLUMN_PATH, &folder, -1);
+
+	if (folder != NULL)
+		g_ptr_array_add (expanded, folder);
+}
+
 static void
 fr_window_update_dir_tree (FrWindow *window)
 {
@@ -1698,6 +1737,20 @@ fr_window_update_dir_tree (FrWindow *window)
 	GHashTable *dir_cache;
 	guint       i;
 	GdkPixbuf  *icon;
+	GPtrArray  *expanded;
+
+	/* Remember the open folders, to open them again once the tree is built. */
+	expanded = g_ptr_array_new_with_free_func (g_free);
+	gtk_tree_view_map_expanded_rows (GTK_TREE_VIEW (window->priv->tree_view),
+					 collect_expanded_row_cb,
+					 expanded);
+
+	/* Rebuilding the tree changes its selection (the first row is selected
+	 * when the tree has the keyboard focus), which would go to another
+	 * folder.  The right row is selected again at the end. */
+	g_signal_handlers_block_by_func (gtk_tree_view_get_selection (GTK_TREE_VIEW (window->priv->tree_view)),
+					 G_CALLBACK (dir_tree_selection_changed_cb),
+					 window);
 
 	gtk_tree_store_clear (window->priv->tree_store);
 
@@ -1707,6 +1760,10 @@ fr_window_update_dir_tree (FrWindow *window)
 	{
 		gtk_widget_set_sensitive (window->priv->tree_view, FALSE);
 		gtk_widget_hide (window->priv->sidepane);
+		g_ptr_array_free (expanded, TRUE);
+		g_signal_handlers_unblock_by_func (gtk_tree_view_get_selection (GTK_TREE_VIEW (window->priv->tree_view)),
+						   G_CALLBACK (dir_tree_selection_changed_cb),
+						   window);
 		return;
 	}
 	else {
@@ -1817,7 +1874,25 @@ fr_window_update_dir_tree (FrWindow *window)
 
 	g_ptr_array_free (dirs, TRUE);
 
+	for (i = 0; i < expanded->len; i++) {
+		const char  *folder = g_ptr_array_index (expanded, i);
+		GtkTreeIter  iter;
+
+		if (get_tree_iter_from_path (window, folder, NULL, &iter)) {
+			GtkTreePath *t_path;
+
+			t_path = gtk_tree_model_get_path (GTK_TREE_MODEL (window->priv->tree_store), &iter);
+			gtk_tree_view_expand_row (GTK_TREE_VIEW (window->priv->tree_view), t_path, FALSE);
+			gtk_tree_path_free (t_path);
+		}
+	}
+	g_ptr_array_free (expanded, TRUE);
+
 	fr_window_update_current_location (window);
+
+	g_signal_handlers_unblock_by_func (gtk_tree_view_get_selection (GTK_TREE_VIEW (window->priv->tree_view)),
+					   G_CALLBACK (dir_tree_selection_changed_cb),
+					   window);
 }
 
 static void
@@ -4119,6 +4194,13 @@ fr_window_get_drag_base_dir (FrWindow   *window,
 	if (dragged_folder != NULL)
 		*dragged_folder = NULL;
 
+	/* Known since the drag started. */
+	if (window->priv->dnd_base_dir != NULL) {
+		if (dragged_folder != NULL)
+			*dragged_folder = g_strdup (window->priv->dnd_dragged_folder);
+		return g_strdup (window->priv->dnd_base_dir);
+	}
+
 	if (source == window->priv->list_view)
 		return g_strdup (fr_window_get_current_location (window));
 
@@ -4418,6 +4500,59 @@ fr_window_update_drop_scroll (FrWindow  *window,
 								   window);
 }
 
+#define DROP_NAVIGATE_DELAY   400  /* ms */
+
+static void
+fr_window_cancel_drop_navigate (FrWindow *window)
+{
+	if (window->priv->drop_navigate_timeout != 0) {
+		g_source_remove (window->priv->drop_navigate_timeout);
+		window->priv->drop_navigate_timeout = 0;
+	}
+	g_clear_pointer (&window->priv->drop_navigate_folder, g_free);
+}
+
+static gboolean
+fr_window_drop_navigate_cb (gpointer data)
+{
+	FrWindow *window = data;
+
+	window->priv->drop_navigate_timeout = 0;
+
+	if (window->priv->drop_navigate_folder != NULL) {
+		fr_window_go_to_location (window, window->priv->drop_navigate_folder, FALSE);
+		g_clear_pointer (&window->priv->drop_navigate_folder, g_free);
+	}
+
+	return G_SOURCE_REMOVE;
+}
+
+/* Show the content of the folder of the folder tree that is the destination
+ * of the drag, when the pointer stays on it.  @folder is NULL when the
+ * pointer is not on a valid destination of the folder tree. */
+static void
+fr_window_update_drop_navigate (FrWindow   *window,
+				const char *folder)
+{
+	if ((folder == NULL)
+	    || (strcmp (folder, fr_window_get_current_location (window)) == 0))
+	{
+		fr_window_cancel_drop_navigate (window);
+		return;
+	}
+
+	/* Already planned. */
+	if ((window->priv->drop_navigate_folder != NULL)
+	    && (strcmp (window->priv->drop_navigate_folder, folder) == 0))
+		return;
+
+	fr_window_cancel_drop_navigate (window);
+	window->priv->drop_navigate_folder = g_strdup (folder);
+	window->priv->drop_navigate_timeout = g_timeout_add (DROP_NAVIGATE_DELAY,
+							     fr_window_drop_navigate_cb,
+							     window);
+}
+
 static void
 fr_window_drag_leave (GtkWidget      *widget,
 		      GdkDragContext *context,
@@ -4428,6 +4563,7 @@ fr_window_drag_leave (GtkWidget      *widget,
 
 	fr_window_cancel_drop_expand (window);
 	fr_window_cancel_drop_scroll (window);
+	fr_window_cancel_drop_navigate (window);
 	fr_window_clear_drop_highlight (window);
 }
 
@@ -4484,9 +4620,21 @@ fr_window_drag_motion (GtkWidget      *widget,
 		    || ! fr_window_drop_allowed (window, source, destination_folder))
 		{
 			g_free (destination_folder);
+			fr_window_cancel_drop_navigate (window);
 			fr_window_clear_drop_highlight (window);
 			gdk_drag_status (context, 0, time);
 			return TRUE;
+		}
+
+		{
+			GtkTreePath *tree_row;
+
+			tree_row = fr_window_get_row_at_point (window->priv->tree_view,
+							       widget, x, y);
+			fr_window_update_drop_navigate (window,
+							(tree_row != NULL) ? destination_folder : NULL);
+			if (tree_row != NULL)
+				gtk_tree_path_free (tree_row);
 		}
 
 		g_free (destination_folder);
@@ -4557,9 +4705,24 @@ fr_window_drag_data_received  (GtkWidget          *widget,
 	    || (source == window->priv->tree_view))
 	{
 		FrClipboardData *dnd_data;
+		char            *show_destination = NULL;
+		gboolean         drop_on_tree;
+
+		drop_on_tree = FALSE;
+		{
+			GtkTreePath *tree_row;
+
+			tree_row = fr_window_get_row_at_point (window->priv->tree_view,
+							       widget, x, y);
+			if (tree_row != NULL) {
+				drop_on_tree = TRUE;
+				gtk_tree_path_free (tree_row);
+			}
+		}
 
 		fr_window_cancel_drop_expand (window);
 		fr_window_cancel_drop_scroll (window);
+		fr_window_cancel_drop_navigate (window);
 		fr_window_clear_drop_highlight (window);
 
 		if ((window->priv->activity_ref > 0)
@@ -4653,8 +4816,22 @@ fr_window_drag_data_received  (GtkWidget          *widget,
 			       : FR_CLIPBOARD_OP_MOVE;
 		dnd_data->current_dir = destination_folder;
 
+		window->priv->dnd_dropped = TRUE;
+
+		/* Dropped on the folder tree: show the destination folder, with the
+		 * dropped items once they are added, and the folder tree open
+		 * down to it. */
+		if (drop_on_tree)
+			show_destination = g_strdup (dnd_data->current_dir);
+
 		gtk_drag_finish (context, TRUE, FALSE, time);
 		fr_window_paste_from_clipboard_data (window, dnd_data);
+
+		if (show_destination != NULL) {
+			fr_window_go_to_location (window, show_destination, FALSE);
+			g_free (show_destination);
+		}
+
 		return;
 	}
 
@@ -4802,6 +4979,9 @@ fr_window_drag_data_received  (GtkWidget          *widget,
 	debug (DEBUG_INFO, "::DragDataReceived <--\n");
 }
 
+static void fr_window_dnd_snapshot_take (FrWindow  *window,
+					 GtkWidget *source);
+
 static gboolean
 file_list_drag_begin (GtkWidget          *widget,
 		      GdkDragContext     *context,
@@ -4825,6 +5005,8 @@ file_list_drag_begin (GtkWidget          *widget,
 	g_free (window->priv->drag_base_dir);
 	window->priv->drag_base_dir = NULL;
 
+	fr_window_dnd_snapshot_take (window, widget);
+
 	gdk_property_change (gdk_drag_context_get_source_window (context),
 			     XDS_ATOM, TEXT_ATOM,
 			     8, GDK_PROP_MODE_REPLACE,
@@ -4842,6 +5024,21 @@ file_list_drag_end (GtkWidget      *widget,
 	FrWindow *window = data;
 
 	debug (DEBUG_INFO, "::DragEnd -->\n");
+
+	fr_window_cancel_drop_navigate (window);
+
+	/* The drag was cancelled or dropped elsewhere: show the folder that was
+	 * shown when it started. */
+	if (! window->priv->dnd_dropped
+	    && (window->priv->dnd_origin != NULL)
+	    && (strcmp (window->priv->dnd_origin,
+			fr_window_get_current_location (window)) != 0))
+		fr_window_go_to_location (window, window->priv->dnd_origin, FALSE);
+
+	g_clear_pointer (&window->priv->dnd_data, g_free);
+	g_clear_pointer (&window->priv->dnd_base_dir, g_free);
+	g_clear_pointer (&window->priv->dnd_dragged_folder, g_free);
+	g_clear_pointer (&window->priv->dnd_origin, g_free);
 
 	gdk_property_delete (gdk_drag_context_get_source_window (context), XDS_ATOM);
 
@@ -4953,6 +5150,54 @@ get_selection_data_from_clipboard_data (FrWindow        *window,
 	return g_string_free (list, FALSE);
 }
 
+/* Remember what is dragged when the drag starts, because the file list can
+ * show another folder while the pointer is on the folder tree. */
+static void
+fr_window_dnd_snapshot_take (FrWindow  *window,
+			     GtkWidget *source)
+{
+	FrClipboardData *tmp;
+	char            *base_dir;
+	char            *dragged_folder = NULL;
+
+	g_clear_pointer (&window->priv->dnd_data, g_free);
+	g_clear_pointer (&window->priv->dnd_base_dir, g_free);
+	g_clear_pointer (&window->priv->dnd_dragged_folder, g_free);
+	g_clear_pointer (&window->priv->dnd_origin, g_free);
+	window->priv->dnd_dropped = FALSE;
+
+	if ((source != window->priv->list_view)
+	    && (source != window->priv->tree_view))
+		return;
+
+	base_dir = fr_window_get_drag_base_dir (window, source, &dragged_folder);
+	if (base_dir == NULL)
+		return;
+
+	tmp = fr_clipboard_data_new ();
+	if (source == window->priv->list_view)
+		tmp->files = fr_window_get_file_list_selection (window, TRUE, NULL);
+	else
+		tmp->files = fr_window_get_folder_tree_selection (window, TRUE, NULL);
+
+	if (tmp->files == NULL) {
+		fr_clipboard_data_unref (tmp);
+		g_free (base_dir);
+		g_free (dragged_folder);
+		return;
+	}
+
+	tmp->op = FR_CLIPBOARD_OP_COPY;
+	tmp->base_dir = g_strdup (fr_window_get_current_location (window));
+
+	window->priv->dnd_data = get_selection_data_from_clipboard_data (window, tmp);
+	window->priv->dnd_base_dir = base_dir;
+	window->priv->dnd_dragged_folder = dragged_folder;
+	window->priv->dnd_origin = g_strdup (fr_window_get_current_location (window));
+
+	fr_clipboard_data_unref (tmp);
+}
+
 static gboolean
 fr_window_folder_tree_drag_data_get (GtkWidget        *widget,
 				     GdkDragContext   *context,
@@ -4970,6 +5215,16 @@ fr_window_folder_tree_drag_data_get (GtkWidget        *widget,
 
 	if (window->priv->activity_ref > 0)
 		return FALSE;
+
+	/* What was dragged when the drag started. */
+	if ((gtk_selection_data_get_target (selection_data) == XFR_ATOM)
+	    && (window->priv->dnd_data != NULL))
+	{
+		gtk_selection_data_set (selection_data, XFR_ATOM, 8,
+					(guchar *) window->priv->dnd_data,
+					strlen (window->priv->dnd_data));
+		return TRUE;
+	}
 
 	file_list = fr_window_get_folder_tree_selection (window, TRUE, NULL);
 	if (file_list == NULL)
@@ -5053,6 +5308,16 @@ fr_window_file_list_drag_data_get (FrWindow         *window,
 
 	if (window->priv->activity_ref > 0)
 		return FALSE;
+
+	/* What was dragged when the drag started. */
+	if ((gtk_selection_data_get_target (selection_data) == XFR_ATOM)
+	    && (window->priv->dnd_data != NULL))
+	{
+		gtk_selection_data_set (selection_data, XFR_ATOM, 8,
+					(guchar *) window->priv->dnd_data,
+					strlen (window->priv->dnd_data));
+		return TRUE;
+	}
 
 	if (gtk_selection_data_get_target (selection_data) == XFR_ATOM) {
 		FrClipboardData *tmp;
@@ -7663,6 +7928,7 @@ fr_window_go_to_location (FrWindow   *window,
 
 	g_return_if_fail (window != NULL);
 	g_return_if_fail (path != NULL);
+
 
 	if (force_update) {
 		g_free (window->priv->last_location);
