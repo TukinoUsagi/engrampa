@@ -310,6 +310,16 @@ struct _FrWindowPrivateData {
 	FRConvertData    convert_data;
 	char            *empty_folder_temp_dir;
 
+	/* Drag and drop on the folder tree: open a collapsed folder when the
+	 * pointer stays on it, and scroll the tree near its borders. */
+	guint            drop_expand_timeout;
+	char            *drop_expand_path;
+	guint            drop_scroll_timeout;
+	int              drop_scroll_direction;
+	int              drop_last_x;
+	int              drop_last_y;
+	gboolean         drop_last_copy;
+
 	gboolean         stoppable;
 	gboolean         closing;
 
@@ -575,6 +585,16 @@ fr_window_free_private_data (FrWindow *window)
 	if (window->priv->empty_folder_temp_dir != NULL) {
 		remove_local_directory (window->priv->empty_folder_temp_dir);
 		g_clear_pointer (&window->priv->empty_folder_temp_dir, g_free);
+	}
+
+	if (window->priv->drop_expand_timeout != 0) {
+		g_source_remove (window->priv->drop_expand_timeout);
+		window->priv->drop_expand_timeout = 0;
+	}
+	g_clear_pointer (&window->priv->drop_expand_path, g_free);
+	if (window->priv->drop_scroll_timeout != 0) {
+		g_source_remove (window->priv->drop_scroll_timeout);
+		window->priv->drop_scroll_timeout = 0;
 	}
 
 	g_clear_error (&window->priv->drag_error);
@@ -4227,13 +4247,188 @@ fr_window_set_drop_highlight (FrWindow  *window,
 	gtk_tree_path_free (path);
 }
 
+#define DROP_EXPAND_DELAY     700  /* ms */
+#define DROP_SCROLL_MARGIN     28  /* pixels from the border of the tree */
+#define DROP_SCROLL_STEP       14  /* pixels */
+#define DROP_SCROLL_INTERVAL   50  /* ms */
+
+static void
+fr_window_cancel_drop_expand (FrWindow *window)
+{
+	if (window->priv->drop_expand_timeout != 0) {
+		g_source_remove (window->priv->drop_expand_timeout);
+		window->priv->drop_expand_timeout = 0;
+	}
+	g_clear_pointer (&window->priv->drop_expand_path, g_free);
+}
+
+static void
+fr_window_cancel_drop_scroll (FrWindow *window)
+{
+	if (window->priv->drop_scroll_timeout != 0) {
+		g_source_remove (window->priv->drop_scroll_timeout);
+		window->priv->drop_scroll_timeout = 0;
+	}
+	window->priv->drop_scroll_direction = 0;
+}
+
+static gboolean
+fr_window_drop_expand_cb (gpointer data)
+{
+	FrWindow *window = data;
+
+	window->priv->drop_expand_timeout = 0;
+
+	if (window->priv->drop_expand_path != NULL) {
+		GtkTreePath *path;
+
+		path = gtk_tree_path_new_from_string (window->priv->drop_expand_path);
+		if (path != NULL) {
+			gtk_tree_view_expand_row (GTK_TREE_VIEW (window->priv->tree_view),
+						  path, FALSE);
+			gtk_tree_path_free (path);
+		}
+		g_clear_pointer (&window->priv->drop_expand_path, g_free);
+	}
+
+	return G_SOURCE_REMOVE;
+}
+
+/* Open a collapsed folder of the folder tree when the pointer stays on it
+ * while dragging. */
+static void
+fr_window_update_drop_expand (FrWindow  *window,
+			      GtkWidget *widget,
+			      gint       x,
+			      gint       y)
+{
+	GtkTreePath *path;
+	char        *path_string = NULL;
+
+	path = fr_window_get_row_at_point (window->priv->tree_view, widget, x, y);
+	if (path != NULL) {
+		GtkTreeIter iter;
+
+		if (gtk_tree_model_get_iter (GTK_TREE_MODEL (window->priv->tree_store),
+					     &iter, path)
+		    && gtk_tree_model_iter_has_child (GTK_TREE_MODEL (window->priv->tree_store),
+						      &iter)
+		    && ! gtk_tree_view_row_expanded (GTK_TREE_VIEW (window->priv->tree_view),
+						     path))
+			path_string = gtk_tree_path_to_string (path);
+
+		gtk_tree_path_free (path);
+	}
+
+	if (path_string == NULL) {
+		fr_window_cancel_drop_expand (window);
+		return;
+	}
+
+	/* Still on the same row: let the timer run. */
+	if ((window->priv->drop_expand_path != NULL)
+	    && (strcmp (window->priv->drop_expand_path, path_string) == 0))
+	{
+		g_free (path_string);
+		return;
+	}
+
+	fr_window_cancel_drop_expand (window);
+	window->priv->drop_expand_path = path_string;
+	window->priv->drop_expand_timeout = g_timeout_add (DROP_EXPAND_DELAY,
+							   fr_window_drop_expand_cb,
+							   window);
+}
+
+static gboolean
+fr_window_drop_scroll_cb (gpointer data)
+{
+	FrWindow      *window = data;
+	GtkAdjustment *adjustment;
+	double         value;
+	double         new_value;
+	double         max_value;
+
+	if (window->priv->drop_scroll_direction == 0) {
+		window->priv->drop_scroll_timeout = 0;
+		return G_SOURCE_REMOVE;
+	}
+
+	adjustment = gtk_scrollable_get_vadjustment (GTK_SCROLLABLE (window->priv->tree_view));
+	if (adjustment == NULL) {
+		window->priv->drop_scroll_timeout = 0;
+		return G_SOURCE_REMOVE;
+	}
+
+	value = gtk_adjustment_get_value (adjustment);
+	max_value = MAX (gtk_adjustment_get_lower (adjustment),
+			 gtk_adjustment_get_upper (adjustment) - gtk_adjustment_get_page_size (adjustment));
+	new_value = CLAMP (value + (window->priv->drop_scroll_direction * DROP_SCROLL_STEP),
+			   gtk_adjustment_get_lower (adjustment),
+			   max_value);
+
+	if (new_value != value) {
+		gtk_adjustment_set_value (adjustment, new_value);
+
+		/* The rows moved under the pointer: refresh the frame. */
+		fr_window_set_drop_highlight (window,
+					     GTK_WIDGET (window),
+					     window->priv->drop_last_x,
+					     window->priv->drop_last_y,
+					     window->priv->drop_last_copy);
+	}
+
+	return G_SOURCE_CONTINUE;
+}
+
+/* Scroll the folder tree while the pointer is near its top or bottom. */
+static void
+fr_window_update_drop_scroll (FrWindow  *window,
+			      GtkWidget *widget,
+			      gint       x,
+			      gint       y,
+			      gboolean   copy)
+{
+	GtkWidget *tree = window->priv->tree_view;
+	gint       tree_x;
+	gint       tree_y;
+	int        direction = 0;
+
+	if (gtk_widget_get_mapped (tree)
+	    && gtk_widget_translate_coordinates (widget, tree, x, y, &tree_x, &tree_y)
+	    && (tree_x >= 0)
+	    && (tree_x < gtk_widget_get_allocated_width (tree)))
+	{
+		int height = gtk_widget_get_allocated_height (tree);
+
+		if ((tree_y >= 0) && (tree_y < DROP_SCROLL_MARGIN))
+			direction = -1;
+		else if ((tree_y < height) && (tree_y >= height - DROP_SCROLL_MARGIN))
+			direction = 1;
+	}
+
+	window->priv->drop_scroll_direction = direction;
+	window->priv->drop_last_x = x;
+	window->priv->drop_last_y = y;
+	window->priv->drop_last_copy = copy;
+
+	if ((direction != 0) && (window->priv->drop_scroll_timeout == 0))
+		window->priv->drop_scroll_timeout = g_timeout_add (DROP_SCROLL_INTERVAL,
+								   fr_window_drop_scroll_cb,
+								   window);
+}
+
 static void
 fr_window_drag_leave (GtkWidget      *widget,
 		      GdkDragContext *context,
 		      guint           time,
 		      gpointer        user_data)
 {
-	fr_window_clear_drop_highlight ((FrWindow *) user_data);
+	FrWindow *window = user_data;
+
+	fr_window_cancel_drop_expand (window);
+	fr_window_cancel_drop_scroll (window);
+	fr_window_clear_drop_highlight (window);
 }
 
 /* Color of the frame drawn around the drop target folder.
@@ -4279,6 +4474,10 @@ fr_window_drag_motion (GtkWidget      *widget,
 	if ((source == window->priv->list_view)
 	    || (source == window->priv->tree_view))
 	{
+		fr_window_update_drop_expand (window, widget, x, y);
+		fr_window_update_drop_scroll (window, widget, x, y,
+					     fr_window_drag_is_copy (widget, context));
+
 		if ((window->priv->activity_ref > 0)
 		    || ! fr_window_get_drop_folder (window, widget, x, y,
 						    &destination_folder)
@@ -4359,6 +4558,8 @@ fr_window_drag_data_received  (GtkWidget          *widget,
 	{
 		FrClipboardData *dnd_data;
 
+		fr_window_cancel_drop_expand (window);
+		fr_window_cancel_drop_scroll (window);
 		fr_window_clear_drop_highlight (window);
 
 		if ((window->priv->activity_ref > 0)
